@@ -1064,24 +1064,30 @@ func (f *Fs) setUploadCutoff(cs fs.SizeSuffix) (old fs.SizeSuffix, err error) {
 }
 
 func parseRootID(s string) (rootID string, err error) {
-	rootID = s
+	re := regexp.MustCompile(`\{([^}]{5,})\}`)
+	m := re.FindStringSubmatch(s)
+	if m == nil {
+		return "", errors.Errorf("%s doesn't not contain valid id", s)
+	}
+	rootID = m[1]
 
-	if strings.HasPrefix(s, "http") {
+	if strings.HasPrefix(rootID, "http") {
 		// folders - https://drive.google.com/drive/u/0/folders/
 		// file - https://drive.google.com/file/d/
-		re := regexp.MustCompile(`\/(folders|files|file\/d)\/([A-Za-z0-9_-]+)\/?`)
-		if m := re.FindStringSubmatch(s); m != nil {
-			rootID = m[2]
+		re := regexp.MustCompile(`\/(folders|files|file\/d)(\/([A-Za-z0-9_-]{6,}))+\/?`)
+		if m := re.FindStringSubmatch(rootID); m != nil {
+			rootID = m[len(m)-1]
 			return
 		}
 
 		// id - https://drive.google.com/open?id=
-		re = regexp.MustCompile(`.+id=([A-Za-z0-9_-]+).?`)
-		if m := re.FindStringSubmatch(s); m != nil {
+		re = regexp.MustCompile(`.+id=([A-Za-z0-9_-]{6,}).?`)
+		if m := re.FindStringSubmatch(rootID); m != nil {
 			rootID = m[1]
 			return
 		}
 	}
+
 	return
 }
 
@@ -1095,27 +1101,11 @@ func newFs(ctx context.Context, name, path string, m configmap.Mapper) (*Fs, err
 	err := configstruct.Set(m, opt)
 
 	// DriveMod: parse object id from path remote:{ID}
-	// isFileID := false
-	if path != "" && path[0:1] == "{" && strings.Contains(path, "}") {
-		idIndex := strings.Index(path, "}")
-		if idIndex > 0 {
-			rootID, err := parseRootID(path[1:idIndex])
-			if err != nil {
-
-			} else {
-				name += rootID
-				fs.Debugf(nil, "Root ID detected: %s", rootID)
-				//opt.ServerSideAcrossConfigs = true
-				if len(rootID) == 33 || len(rootID) == 28 {
-					// isFileID = true
-					opt.RootFolderID = rootID
-				} else {
-					opt.RootFolderID = rootID
-					opt.TeamDriveID = rootID
-				}
-				path = path[idIndex+1:]
-			}
-		}
+	if rootID, _ := parseRootID(path); len(rootID) > 6 {
+		// fs.Debugf(nil, "Root ID detected: %s", rootID)
+		name += rootID
+		// opt.RootFolderID = rootID
+		path = path[strings.Index(path, "}")+1:]
 	}
 
 	if err != nil {
@@ -1186,6 +1176,37 @@ func NewFs(ctx context.Context, name, path string, m configmap.Mapper) (fs.Fs, e
 		return nil, err
 	}
 
+	// Driveurl: parse object id from path remote:{ID}
+	// isFileID := false
+	var srcFile *drive.File
+	if rootID, _ := parseRootID(path); len(rootID) > 6 {
+
+		err = f.pacer.Call(func() (bool, error) {
+			srcFile, err = f.svc.Files.Get(rootID).
+				Fields("name", "id", "size", "mimeType", "driveId").
+				SupportsAllDrives(true).
+				Do()
+			return f.shouldRetry(err)
+		})
+		if err == nil {
+			if srcFile.MimeType != "" && srcFile.MimeType != "application/vnd.google-apps.folder" {
+				fs.Debugf(nil, "Root ID (File): %s", rootID)
+				f.opt.RootFolderID = rootID
+			} else {
+				if srcFile.DriveId == rootID {
+					fs.Debugf(nil, "Root ID (Drive): %s", rootID)
+					f.opt.RootFolderID = ""
+					f.opt.TeamDriveID = rootID
+				} else {
+					fs.Debugf(nil, "Root ID (Folder): %s", rootID)
+					f.opt.RootFolderID = rootID
+				}
+				srcFile = nil
+			}
+			f.isTeamDrive = f.opt.TeamDriveID != ""
+		}
+	}
+
 	// Set the root folder ID
 	if f.opt.RootFolderID != "" {
 		// use root_folder ID if set
@@ -1226,6 +1247,22 @@ func NewFs(ctx context.Context, name, path string, m configmap.Mapper) (fs.Fs, e
 	_, f.importMimeTypes, err = parseExtensions(f.opt.ImportExtensions)
 	if err != nil {
 		return nil, err
+	}
+
+	// Driveurl: confirm the object ID is file
+	if srcFile != nil {
+		tempF := *f
+		newRoot := ""
+		tempF.dirCache = dircache.New(newRoot, f.rootFolderID, &tempF)
+		tempF.root = newRoot
+		f.dirCache = tempF.dirCache
+		f.root = tempF.root
+
+		extension, exportName, exportMimeType, isDocument := f.findExportFormat(srcFile)
+		obj, _ := f.newObjectWithExportInfo(srcFile.Name, srcFile, extension, exportName, exportMimeType, isDocument)
+		f.root = "isFile:" + srcFile.Name
+		f.FileObj = &obj
+		return f, fs.ErrorIsFile
 	}
 
 	// Find the current root
