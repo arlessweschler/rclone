@@ -1176,37 +1176,6 @@ func NewFs(ctx context.Context, name, path string, m configmap.Mapper) (fs.Fs, e
 		return nil, err
 	}
 
-	// Driveurl: parse object id from path remote:{ID}
-	// isFileID := false
-	var srcFile *drive.File
-	if rootID, _ := parseRootID(path); len(rootID) > 6 {
-
-		err = f.pacer.Call(func() (bool, error) {
-			srcFile, err = f.svc.Files.Get(rootID).
-				Fields("name", "id", "size", "mimeType", "driveId").
-				SupportsAllDrives(true).
-				Do()
-			return f.shouldRetry(err)
-		})
-		if err == nil {
-			if srcFile.MimeType != "" && srcFile.MimeType != "application/vnd.google-apps.folder" {
-				fs.Debugf(nil, "Root ID (File): %s", rootID)
-				f.opt.RootFolderID = rootID
-			} else {
-				if srcFile.DriveId == rootID {
-					fs.Debugf(nil, "Root ID (Drive): %s", rootID)
-					f.opt.RootFolderID = ""
-					f.opt.TeamDriveID = rootID
-				} else {
-					fs.Debugf(nil, "Root ID (Folder): %s", rootID)
-					f.opt.RootFolderID = rootID
-				}
-				srcFile = nil
-			}
-			f.isTeamDrive = f.opt.TeamDriveID != ""
-		}
-	}
-
 	// Set the root folder ID
 	if f.opt.RootFolderID != "" {
 		// use root_folder ID if set
@@ -1247,22 +1216,6 @@ func NewFs(ctx context.Context, name, path string, m configmap.Mapper) (fs.Fs, e
 	_, f.importMimeTypes, err = parseExtensions(f.opt.ImportExtensions)
 	if err != nil {
 		return nil, err
-	}
-
-	// Driveurl: confirm the object ID is file
-	if srcFile != nil {
-		tempF := *f
-		newRoot := ""
-		tempF.dirCache = dircache.New(newRoot, f.rootFolderID, &tempF)
-		tempF.root = newRoot
-		f.dirCache = tempF.dirCache
-		f.root = tempF.root
-
-		extension, exportName, exportMimeType, isDocument := f.findExportFormat(srcFile)
-		obj, _ := f.newObjectWithExportInfo(srcFile.Name, srcFile, extension, exportName, exportMimeType, isDocument)
-		f.root = "isFile:" + srcFile.Name
-		f.FileObj = &obj
-		return f, fs.ErrorIsFile
 	}
 
 	// Find the current root
